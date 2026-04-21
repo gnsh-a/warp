@@ -2,8 +2,9 @@
 ANCF flexible-beam multibody-dynamics simulator (NumPy, CPU).
 
 Cantilever beam clamped at the origin, with a short time-varying tip load
-plus gravity, integrated in time with BDF-1 (implicit Euler) and a Lagrange
-multiplier constraint on the clamped node. St. Venant-Kirchhoff material.
+plus gravity, integrated in time with BDF-1 (implicit Euler). The clamped
+BC is a Dirichlet constraint enforced by direct elimination of the fixed
+DOFs from the Newton system. St. Venant-Kirchhoff material.
 
 Element: B3-24 ANCF (8 nodes x 3 DOFs = 24 DOFs per element).
 Each element has 8 "nodes" grouped as [position, d/du, d/dv, d/dw] at each
@@ -343,10 +344,24 @@ def compute_internal_force(ctx, x_n):
 # =========================================================================
 # Constraints: node 1 clamped (position + 3 gradient frames)
 # =========================================================================
+#
+# The clamped cantilever BC is a Dirichlet / essential constraint — the first
+# 12 DOFs (node 1 position and its three gradient frames) are held at fixed
+# values for all time. We enforce this by *direct elimination*: those DOFs are
+# simply removed from the Newton unknowns. The reduced stiffness system is
+# then SPD and (n_dofs - 12) square, which is cheaper and better conditioned
+# than the saddle-point form that arises from Lagrange multipliers.
+#
+# NOTE: direct elimination works only for constraints of the form "DOF_i =
+# const" (Dirichlet / fixed-value). For general bilateral constraints
+# c(x) = 0 — rigid-body connectors, coupling constraints, non-holonomic
+# joints, etc. — Lagrange multipliers (or penalty / augmented-Lagrangian)
+# are still required. Revisit this module if non-fixed-value constraints
+# are ever added.
 
 # Clamped-cantilever target for the first 12 DOFs of node 1:
 # position at origin with identity gradient frame (tangent along +x, normals
-# along +y, +z). Used in compute_constraint and in informational prints.
+# along +y, +z).
 CLAMP_TARGET = np.array(
     [
         0.0,
@@ -363,18 +378,6 @@ CLAMP_TARGET = np.array(
         1.0,  # d/dw
     ]
 )
-
-
-def compute_constraint(x_n):
-    """c = x_first_12 - CLAMP_TARGET, (12, 1). Zero when clamped."""
-    return (x_n[0:12] - CLAMP_TARGET).reshape(-1, 1)
-
-
-def compute_constraint_derivative(ctx):
-    """c_e = d(c)/d(x_n), (12, n_dofs). Identity on first 12 DOFs."""
-    c_e = np.zeros((12, ctx.n_dofs))
-    c_e[0:12, 0:12] = np.eye(12)
-    return c_e
 
 
 # =========================================================================
@@ -458,14 +461,17 @@ def compute_tangent_analytic(ctx, x_n):
 
 
 # =========================================================================
-# Residual and Jacobian for BDF-1 + Lagrange multipliers
+# Residual and Jacobian for BDF-1 (Dirichlet BCs eliminated)
 # =========================================================================
 
 
-def compute_residual(ctx, a_n, lambda_n, x_prev, v_prev, t, h, M_e, G_f):
-    """Augmented residual [R_dyn; R_con/h^2], shape (n_dofs + 12, 1)."""
+def compute_residual(ctx, a_n, x_prev, v_prev, t, h, M_e, G_f):
+    """Dynamic residual R = M*a + f_int - G - F_ext, shape (n_dofs, 1).
+
+    No constraint term: the clamped DOFs are handled by elimination in the
+    Newton solver, not by Lagrange multipliers.
+    """
     a_n = np.asarray(a_n).reshape(-1, 1)
-    lambda_n = np.asarray(lambda_n).reshape(-1, 1)
     x_prev = np.asarray(x_prev).flatten()
     v_prev = np.asarray(v_prev).flatten()
     G_f = np.asarray(G_f).reshape(-1, 1)
@@ -482,51 +488,36 @@ def compute_residual(ctx, a_n, lambda_n, x_prev, v_prev, t, h, M_e, G_f):
     F_ext_global = np.zeros((ctx.n_dofs, 1))
     F_ext_global.reshape(ctx.N_coef, 3)[conn_tip, :] = np.outer(s_tip, f_tip_vec)
 
-    c_e = compute_constraint_derivative(ctx)
-
-    R_dynamics = M_e @ a_n + c_e.T @ lambda_n + f_int - G_f - F_ext_global
-    R_constraint = compute_constraint(x_n) / h**2
-    return np.vstack([R_dynamics, R_constraint])
+    return M_e @ a_n + f_int - G_f - F_ext_global
 
 
 def compute_jacobian(ctx, x_n, M_e, h):
-    """Augmented Jacobian [[M + h^2 K, c_e^T], [c_e, 0]]."""
-    K_tangent = compute_tangent_analytic(ctx, x_n)
-    c_e = compute_constraint_derivative(ctx)
-
-    n = ctx.n_dofs
-    m = ctx.n_constraints
-    size_J = n + m
-
-    J = np.zeros((size_J, size_J))
-    J[0:n, 0:n] = M_e + h**2 * K_tangent
-    J[0:n, n:size_J] = c_e.T
-    J[n:size_J, 0:n] = c_e
-    # bottom-right block stays zero
-    return J
+    """BDF-1 Jacobian J = M + h^2 * K_tangent, shape (n_dofs, n_dofs), SPD."""
+    return M_e + h**2 * compute_tangent_analytic(ctx, x_n)
 
 
 # =========================================================================
-# Newton-Raphson solve for acceleration + Lagrange multipliers
+# Newton-Raphson solve for acceleration (clamped DOFs eliminated)
 # =========================================================================
 
 
-def solve_acceleration_newton(
-    ctx, x_prev, v_prev, t, h, M_e, G_f, tol=1e-6, max_iter=10, a_init=None, lambda_init=None
-):
-    """Solve the augmented system for (a_n, lambda_n) at step t.
+def solve_acceleration_newton(ctx, x_prev, v_prev, t, h, M_e, G_f, tol=1e-6, max_iter=10, a_init=None):
+    """Solve M*a + f_int(x_prev + h*v_prev + h^2*a) = G + F_ext for a_n.
 
-    Warm-started across time steps via a_init / lambda_init.
+    The first n_fix = ctx.n_constraints DOFs are clamped (Dirichlet); their
+    acceleration is identically zero. The Newton update is applied only to
+    the free block, and the reduced Jacobian J[n_fix:, n_fix:] is SPD.
     """
     n = ctx.n_dofs
-    m = ctx.n_constraints
+    n_fix = ctx.n_constraints
 
     a_n = np.zeros(n) if a_init is None else a_init.copy()
-    lambda_n = np.zeros(m) if lambda_init is None else lambda_init.copy()
+    a_n[:n_fix] = 0.0  # clamped DOFs have zero acceleration
 
     for _iter_num in range(max_iter):
-        R = compute_residual(ctx, a_n.reshape(-1, 1), lambda_n.reshape(-1, 1), x_prev, v_prev, t, h, M_e, G_f)
-        R_norm = np.linalg.norm(R)
+        R = compute_residual(ctx, a_n, x_prev, v_prev, t, h, M_e, G_f)
+        R_free = R[n_fix:]
+        R_norm = np.linalg.norm(R_free)
         if R_norm < tol:
             break
 
@@ -534,17 +525,13 @@ def solve_acceleration_newton(
         J = compute_jacobian(ctx, x_n, M_e, h)
 
         try:
-            delta = np.linalg.solve(J, -R)
+            delta_a_free = np.linalg.solve(J[n_fix:, n_fix:], -R_free.ravel())
         except np.linalg.LinAlgError:
             break
 
-        delta_a = delta[0:n].flatten()
-        delta_lambda = delta[n : n + m].flatten()
+        a_n[n_fix:] += delta_a_free
 
-        a_n += delta_a
-        lambda_n += delta_lambda
-
-    return a_n, lambda_n
+    return a_n
 
 
 # =========================================================================
@@ -553,9 +540,9 @@ def solve_acceleration_newton(
 
 
 def simulate_bdf1(ctx, t0, tf, h, x0, v0, tol=1e-6, max_iter=10):
-    """BDF-1 (implicit Euler) with Lagrange-multiplier clamped BC.
+    """BDF-1 (implicit Euler) with clamped Dirichlet BC via direct elimination.
 
-    Always saves every step; returns (x_final, v_final, states, times, lambdas).
+    Always saves every step; returns (x_final, v_final, states, times).
     """
     print("Precomputing constant matrices...")
     M_e = compute_mass_matrix(ctx)
@@ -565,40 +552,35 @@ def simulate_bdf1(ctx, t0, tf, h, x0, v0, tol=1e-6, max_iter=10):
     x_n = x0.copy()
     v_n = v0.copy()
     a_n = np.zeros(ctx.n_dofs)
-    lambda_n = np.zeros(ctx.n_constraints)
 
     t = t0
     n_steps = int((tf - t0) / h)
 
     saved_states = [x_n.copy()]
     saved_times = [t0]
-    saved_lambdas = [lambda_n.copy()]
 
-    print("\nRunning BDF-1 integration with constraints:")
+    print("\nRunning BDF-1 integration with clamped BC:")
     print(f"  Time: {t0:.6f} to {tf:.6f} s")
     print(f"  Time step: {h:.6e} s")
     print(f"  Number of steps: {n_steps}")
     print(f"  Newton tolerance: {tol:.2e}")
     print(f"  Max Newton iterations: {max_iter}")
-    print(f"  Constraint: Node 1 clamped (position + gradients) at {CLAMP_TARGET}\n")
+    print(f"  Clamped DOFs 0..{ctx.n_constraints - 1} fixed at {CLAMP_TARGET}\n")
 
     for step in range(1, n_steps + 1):
         t = t0 + step * h
-        a_n, lambda_n = solve_acceleration_newton(
-            ctx, x_n, v_n, t, h, M_e, G_f, tol, max_iter, a_init=a_n, lambda_init=lambda_n
-        )
+        a_n = solve_acceleration_newton(ctx, x_n, v_n, t, h, M_e, G_f, tol, max_iter, a_init=a_n)
 
         x_n = x_n + h * v_n + h**2 * a_n
         v_n = v_n + h * a_n
 
         saved_states.append(x_n.copy())
         saved_times.append(t)
-        saved_lambdas.append(lambda_n.copy())
 
     print("\nIntegration complete!")
     print(f"Final time: {t:.6f} s")
 
-    return x_n, v_n, saved_states, saved_times, saved_lambdas
+    return x_n, v_n, saved_states, saved_times
 
 
 # =========================================================================
@@ -648,7 +630,7 @@ def main(n_elements: int = 1, tf: float = 10.0, h: float = 5e-4):
     ctx, x0, v0 = build_mesh(n_elements, L_total)
     print(f"SIMULATION SETUP: L_total={L_total}m, Elements={ctx.n_beam}, L_elem={ctx.L_elem:.4f}m")
 
-    _, _, saved_states, saved_times, _ = simulate_bdf1(ctx, t0=0.0, tf=tf, h=h, x0=x0, v0=v0, tol=1e-6, max_iter=100)
+    _, _, saved_states, saved_times = simulate_bdf1(ctx, t0=0.0, tf=tf, h=h, x0=x0, v0=v0, tol=1e-6, max_iter=100)
 
     save_tip_positions_csv(ctx, saved_states, saved_times, h)
 
