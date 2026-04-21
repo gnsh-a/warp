@@ -28,6 +28,9 @@ CLAUDE.local.md
 .claude/settings.local.json
 .claude/worktrees/
 
+# Scratch workspace
+/temp/
+
 # Development and testing
 *.o
 *.exp
