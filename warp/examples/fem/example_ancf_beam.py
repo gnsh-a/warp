@@ -385,8 +385,8 @@ def compute_constraint_derivative(ctx):
 def compute_tangent_stiffness_numerical(ctx, x_n, eps=1e-6):
     """Numerical tangent K[i, j] = (f_int(x + eps*e_j) - f_int(x))[i] / eps.
 
-    Column-serial loop — preserves FP ordering of the original. Replace with
-    analytic or autodiff in a later step; this is the dominant CPU cost.
+    Column-serial loop — O(n_dofs) extra force evals per call. Kept as a
+    validation oracle for the analytic tangent; not used by the solver path.
     """
     n = ctx.n_dofs
     f0 = compute_internal_force(ctx, x_n).ravel()
@@ -398,6 +398,63 @@ def compute_tangent_stiffness_numerical(ctx, x_n, eps=1e-6):
         fp = compute_internal_force(ctx, xp).ravel()
         K[:, j] = (fp - f0) / eps
     return K
+
+
+def compute_tangent_analytic(ctx, x_n):
+    """Analytic tangent K = df_int/dx for St. Venant-Kirchhoff material.
+
+    Derived from P = F*S, S = lam*tr(E)*I + 2*mu*E, E = 0.5*(F^T F - I):
+
+        dP_ij/dF_mn = delta_im*S_nj + lam*F_ij*F_mn
+                    + mu*F_in*F_mj  + mu*B_im*delta_jn        (B = F F^T)
+
+    Chain-ruled with dF_mn/dx[J,b] = delta_mb*H[g,J,n] gives
+
+        K_IJ[a,b] = sum_g w_g * (
+              delta_ab * (H_I . S . H_J)
+            + lam * u_I[a] * u_J[b]
+            + mu  * u_J[a] * u_I[b]
+            + mu  * B_ab * (H_I . H_J)
+        )    with u_K = F . H_K  (3-vector per node per GP).
+
+    K is symmetric (first Piola-Kirchhoff of a hyperelastic potential).
+    Single element-loop pass, fully vectorized over 16 Gauss points.
+    """
+    H = ctx.gauss.H  # (16, 8, 3)
+    W = ctx.gauss.weights  # (16,)
+    lam, mu = ctx.lam, ctx.mu
+    I3 = np.eye(3)
+
+    K_global = np.zeros((ctx.n_dofs, ctx.n_dofs))
+    x_nodes = x_n.reshape(ctx.N_coef, 3)
+
+    for elem in range(ctx.n_beam):
+        conn = ctx.elem_conn[elem]  # (8,)
+        Nmat = x_nodes[conn, :].T  # (3, 8)
+
+        # Gauss-point kinematics and stress
+        F_all = np.einsum("ij,gjk->gik", Nmat, H)  # (16, 3, 3)  F
+        E_all = 0.5 * (np.einsum("gji,gjk->gik", F_all, F_all) - I3[None, :, :])  # (16, 3, 3)  E
+        trE = np.trace(E_all, axis1=1, axis2=2)  # (16,)       tr(E)
+        S_all = lam * trE[:, None, None] * I3[None, :, :] + 2.0 * mu * E_all  # (16, 3, 3)  S (2nd-PK)
+        B_all = np.einsum("gan,gcn->gac", F_all, F_all)  # (16, 3, 3)  F F^T
+        U_all = np.einsum("gan,gIn->gIa", F_all, H)  # (16, 8, 3)  u_I = F H_I
+        Dot = np.einsum("gIn,gJn->gIJ", H, H)  # (16, 8, 8)  H_I . H_J
+        HSH = np.einsum("gIn,gnc,gJc->gIJ", H, S_all, H)  # (16, 8, 8)  H_I . S . H_J
+
+        # Element tangent block indexed (I, a, J, b) = (8, 3, 8, 3)
+        T1 = np.einsum("g,gIJ,ab->IaJb", W, HSH, I3)
+        T2 = lam * np.einsum("g,gIa,gJb->IaJb", W, U_all, U_all)
+        T3 = mu * np.einsum("g,gJa,gIb->IaJb", W, U_all, U_all)
+        T4 = mu * np.einsum("g,gab,gIJ->IaJb", W, B_all, Dot)
+        K_elem = (T1 + T2 + T3 + T4).reshape(24, 24)
+
+        # Scatter into global using flat DOF indices; conn has 8 distinct
+        # entries within one element so += under fancy indexing is safe.
+        rows = (3 * conn[:, None] + np.arange(3)[None, :]).ravel()
+        K_global[np.ix_(rows, rows)] += K_elem
+
+    return K_global
 
 
 # =========================================================================
@@ -434,7 +491,7 @@ def compute_residual(ctx, a_n, lambda_n, x_prev, v_prev, t, h, M_e, G_f):
 
 def compute_jacobian(ctx, x_n, M_e, h):
     """Augmented Jacobian [[M + h^2 K, c_e^T], [c_e, 0]]."""
-    K_tangent = compute_tangent_stiffness_numerical(ctx, x_n)
+    K_tangent = compute_tangent_analytic(ctx, x_n)
     c_e = compute_constraint_derivative(ctx)
 
     n = ctx.n_dofs
