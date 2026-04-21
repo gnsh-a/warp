@@ -308,35 +308,36 @@ def compute_internal_force(ctx, x_n):
     SVK stress P = lam * tr(E) * F + mu * (F F^T F - F),
     i.e. P = F * (lam * tr(E) * I + 2 mu * E) with the 2*mu distributed into
     (F^T F - I). Numerically identical to the standard SVK form.
+
+    Vectorized across all elements (leading axis `e` in the einsums); maps to
+    thread-per-element in a Warp kernel later.
     """
     H = ctx.gauss.H  # (16, 8, 3)
     weights = ctx.gauss.weights  # (16,)
     lam, mu = ctx.lam, ctx.mu
     I3 = np.eye(3)
 
-    f_int_global = np.zeros((ctx.n_dofs, 1))
-    # View into the same buffer as (N_coef, 3) for the scatter.
-    f_int_nodes = f_int_global.reshape(ctx.N_coef, 3)
-
-    # Nodes-first view of current positions: shape (N_coef, 3).
     x_nodes = x_n.reshape(ctx.N_coef, 3)
 
-    for elem in range(ctx.n_beam):
-        conn = ctx.elem_conn[elem]  # (8,)
+    # Batched gather: (n_beam, 3, 8) Nmat per element.
+    Nmat_batch = x_nodes[ctx.elem_conn].transpose(0, 2, 1)  # (n_beam, 3, 8)
 
-        # Gather local nodal positions as (3, 8) Nmat (matches original layout).
-        Nmat = x_nodes[conn, :].T  # (3, 8)
+    # Kinematics + stress, all elements and all Gauss points at once.
+    F_all = np.einsum("eij,gjk->egik", Nmat_batch, H)  # (n_beam, 16, 3, 3)
+    E_all = 0.5 * (np.einsum("egji,egjk->egik", F_all, F_all) - I3)  # (n_beam, 16, 3, 3)
+    trace_E = np.trace(E_all, axis1=2, axis2=3)  # (n_beam, 16)
+    F_FT_F = np.einsum("egil,egjl,egjk->egik", F_all, F_all, F_all)  # (n_beam, 16, 3, 3)
+    P_all = lam * trace_E[..., None, None] * F_all + mu * (F_FT_F - F_all)
+    f_int_elem_batch = np.einsum("gij,egkj,g->eik", H, P_all, weights)  # (n_beam, 8, 3)
 
-        # Gauss-point kernel — identical einsum chain to the original.
-        F_all = np.einsum("ij,gjk->gik", Nmat, H)  # (16, 3, 3)
-        E_all = 0.5 * (np.einsum("gji,gjk->gik", F_all, F_all) - I3[None, :, :])
-        trace_E_all = np.trace(E_all, axis1=1, axis2=2)  # (16,)
-        F_FT_F_all = np.einsum("gil,gjl,gjk->gik", F_all, F_all, F_all)
-        P_all = lam * trace_E_all[:, None, None] * F_all + mu * (F_FT_F_all - F_all)  # (16, 3, 3)
-        f_int_elem = np.einsum("gij,gkj,g->ik", H, P_all, weights)  # (8, 3)
-
-        # Scatter (conn has 8 distinct indices within one element — safe).
-        f_int_nodes[conn, :] += f_int_elem
+    # Scatter: shared nodes between adjacent elements require accumulation
+    # semantics that plain fancy-index += does NOT provide (duplicate-index
+    # writes silently drop). Serial element loop is safe; np.add.at is correct
+    # but slower for small n_beam due to unbuffered update overhead.
+    f_int_global = np.zeros((ctx.n_dofs, 1))
+    f_int_nodes = f_int_global.reshape(ctx.N_coef, 3)
+    for e in range(ctx.n_beam):
+        f_int_nodes[ctx.elem_conn[e], :] += f_int_elem_batch[e]
 
     return f_int_global
 
@@ -421,41 +422,41 @@ def compute_tangent_analytic(ctx, x_n):
         )    with u_K = F . H_K  (3-vector per node per GP).
 
     K is symmetric (first Piola-Kirchhoff of a hyperelastic potential).
-    Single element-loop pass, fully vectorized over 16 Gauss points.
+    Vectorized across all elements (leading axis `e`); maps to thread-per-
+    element in a Warp kernel later.
     """
     H = ctx.gauss.H  # (16, 8, 3)
     W = ctx.gauss.weights  # (16,)
     lam, mu = ctx.lam, ctx.mu
     I3 = np.eye(3)
 
-    K_global = np.zeros((ctx.n_dofs, ctx.n_dofs))
     x_nodes = x_n.reshape(ctx.N_coef, 3)
+    Nmat_batch = x_nodes[ctx.elem_conn].transpose(0, 2, 1)  # (n_beam, 3, 8)
 
-    for elem in range(ctx.n_beam):
-        conn = ctx.elem_conn[elem]  # (8,)
-        Nmat = x_nodes[conn, :].T  # (3, 8)
+    # Kinematics + stress, all elements and all Gauss points at once.
+    F_all = np.einsum("eij,gjk->egik", Nmat_batch, H)  # (n_beam, 16, 3, 3)
+    E_all = 0.5 * (np.einsum("egji,egjk->egik", F_all, F_all) - I3)  # (n_beam, 16, 3, 3)
+    trE = np.trace(E_all, axis1=2, axis2=3)  # (n_beam, 16)
+    S_all = lam * trE[..., None, None] * I3 + 2.0 * mu * E_all  # (n_beam, 16, 3, 3)
+    B_all = np.einsum("egan,egcn->egac", F_all, F_all)  # (n_beam, 16, 3, 3)  F F^T
+    U_all = np.einsum("egan,gIn->egIa", F_all, H)  # (n_beam, 16, 8, 3)  u_I = F H_I
+    Dot = np.einsum("gIn,gJn->gIJ", H, H)  # (16, 8, 8)  H_I . H_J  (element-independent)
+    HSH = np.einsum("gIn,egnc,gJc->egIJ", H, S_all, H)  # (n_beam, 16, 8, 8)
 
-        # Gauss-point kinematics and stress
-        F_all = np.einsum("ij,gjk->gik", Nmat, H)  # (16, 3, 3)  F
-        E_all = 0.5 * (np.einsum("gji,gjk->gik", F_all, F_all) - I3[None, :, :])  # (16, 3, 3)  E
-        trE = np.trace(E_all, axis1=1, axis2=2)  # (16,)       tr(E)
-        S_all = lam * trE[:, None, None] * I3[None, :, :] + 2.0 * mu * E_all  # (16, 3, 3)  S (2nd-PK)
-        B_all = np.einsum("gan,gcn->gac", F_all, F_all)  # (16, 3, 3)  F F^T
-        U_all = np.einsum("gan,gIn->gIa", F_all, H)  # (16, 8, 3)  u_I = F H_I
-        Dot = np.einsum("gIn,gJn->gIJ", H, H)  # (16, 8, 8)  H_I . H_J
-        HSH = np.einsum("gIn,gnc,gJc->gIJ", H, S_all, H)  # (16, 8, 8)  H_I . S . H_J
+    # Element tangent blocks indexed (e, I, a, J, b) = (n_beam, 8, 3, 8, 3)
+    T1 = np.einsum("g,egIJ,ab->eIaJb", W, HSH, I3)
+    T2 = lam * np.einsum("g,egIa,egJb->eIaJb", W, U_all, U_all)
+    T3 = mu * np.einsum("g,egJa,egIb->eIaJb", W, U_all, U_all)
+    T4 = mu * np.einsum("g,egab,gIJ->eIaJb", W, B_all, Dot)
+    K_elem_batch = (T1 + T2 + T3 + T4).reshape(ctx.n_beam, 24, 24)
 
-        # Element tangent block indexed (I, a, J, b) = (8, 3, 8, 3)
-        T1 = np.einsum("g,gIJ,ab->IaJb", W, HSH, I3)
-        T2 = lam * np.einsum("g,gIa,gJb->IaJb", W, U_all, U_all)
-        T3 = mu * np.einsum("g,gJa,gIb->IaJb", W, U_all, U_all)
-        T4 = mu * np.einsum("g,gab,gIJ->IaJb", W, B_all, Dot)
-        K_elem = (T1 + T2 + T3 + T4).reshape(24, 24)
-
-        # Scatter into global using flat DOF indices; conn has 8 distinct
-        # entries within one element so += under fancy indexing is safe.
-        rows = (3 * conn[:, None] + np.arange(3)[None, :]).ravel()
-        K_global[np.ix_(rows, rows)] += K_elem
+    # Scatter into global: shared-node blocks accumulate across elements,
+    # so we serialize (Python loop is fine; per-element scatter is cheap).
+    K_global = np.zeros((ctx.n_dofs, ctx.n_dofs))
+    local_idx = np.arange(3)
+    for e in range(ctx.n_beam):
+        rows = (3 * ctx.elem_conn[e][:, None] + local_idx[None, :]).ravel()
+        K_global[np.ix_(rows, rows)] += K_elem_batch[e]
 
     return K_global
 
