@@ -1,6 +1,10 @@
 """
 ANCF flexible-beam multibody-dynamics simulator (NumPy, CPU).
 
+This file is the NumPy reference implementation for the ANCF beam model.
+It is kept for validation and comparison. For the actual Warp example, see
+``warp/examples/multibody/example_ancf_beam_dense.py``.
+
 Cantilever beam clamped at the origin, with a short time-varying tip load
 plus gravity, integrated in time with BDF-1 (implicit Euler). The clamped
 BC is a Dirichlet constraint enforced by direct elimination of the fixed
@@ -28,7 +32,7 @@ from dataclasses import dataclass
 import numpy as np
 
 # Tip-trajectory CSVs go to the repo-level scratch directory (gitignored), so
-# this example doesn't leave build artifacts in warp/examples/fem/.
+# this example doesn't leave build artifacts in warp/examples/multibody/.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "temp", "ancf", "output")
 
@@ -629,6 +633,8 @@ def save_tip_positions_csv(ctx, saved_states, saved_times, h, output_dir=None):
 def main(n_elements: int = 1, tf: float = 10.0, h: float = 5e-4):
     L_total = 0.5
     ctx, x0, v0 = build_mesh(n_elements, L_total)
+    print("ANCF beam NumPy reference")
+    print("  Warp example: warp/examples/multibody/example_ancf_beam_dense.py")
     print(f"SIMULATION SETUP: L_total={L_total}m, Elements={ctx.n_beam}, L_elem={ctx.L_elem:.4f}m")
 
     _, _, saved_states, saved_times = simulate_bdf1(ctx, t0=0.0, tf=tf, h=h, x0=x0, v0=v0, tol=1e-6, max_iter=100)
