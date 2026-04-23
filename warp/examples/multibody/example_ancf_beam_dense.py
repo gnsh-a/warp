@@ -13,12 +13,11 @@ except ImportError:  # pragma: no cover - optional dependency for CUDA solve pat
 
 import warp as wp
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "temp", "ancf", "output")
+DEFAULT_OUTPUT_DIR = "."
 
 
 # -----------------------------------------------------------------------------
-# Quadrature and ANCF basis
+# Quadrature and ANCF shape functions
 # -----------------------------------------------------------------------------
 
 
@@ -73,7 +72,7 @@ def shape_functions(u: float, v: float, w: float, B_inv: np.ndarray) -> np.ndarr
 
 
 # -----------------------------------------------------------------------------
-# Geometry, material, and initial state
+# Beam setup and host precompute data
 # -----------------------------------------------------------------------------
 
 
@@ -103,11 +102,7 @@ class SimContext:
     gauss: GaussData
 
 
-def _build_B_inv(l_elem: float) -> np.ndarray:
-    return np.linalg.inv(build_B_matrix(l_elem).T)
-
-
-def _build_gauss(l_elem: float, width: float, height: float, B_inv: np.ndarray) -> GaussData:
+def _precompute_element_quadrature(l_elem: float, width: float, height: float, B_inv: np.ndarray) -> GaussData:
     j_det = (l_elem * width * height) / 8.0
 
     gp_u, w_u = gauss_legendre(4)
@@ -153,8 +148,8 @@ def build_mesh(
     n_dofs = 3 * n_coef
 
     elem_conn = 4 * np.arange(n_beam, dtype=np.int64)[:, None] + np.arange(8, dtype=np.int64)[None, :]
-    B_inv = _build_B_inv(l_elem)
-    gauss = _build_gauss(l_elem, width, height, B_inv)
+    B_inv = np.linalg.inv(build_B_matrix(l_elem).T)
+    gauss = _precompute_element_quadrature(l_elem, width, height, B_inv)
 
     lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
     mu = E / (2.0 * (1.0 + nu))
@@ -200,7 +195,7 @@ def F_tip(t: float) -> np.ndarray:
     return np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
 
-def compute_mass_matrix(ctx: SimContext) -> np.ndarray:
+def precompute_mass_matrix(ctx: SimContext) -> np.ndarray:
     """Build the global consistent mass matrix."""
     S = ctx.gauss.S
     weights = ctx.gauss.weights
@@ -220,7 +215,7 @@ def compute_mass_matrix(ctx: SimContext) -> np.ndarray:
     return np.kron(m_global, np.eye(3, dtype=np.float64))
 
 
-def compute_gravity_force(ctx: SimContext, g_vec: np.ndarray) -> np.ndarray:
+def precompute_gravity_force(ctx: SimContext, g_vec: np.ndarray) -> np.ndarray:
     """Build the global gravity force vector."""
     S = ctx.gauss.S
     weights = ctx.gauss.weights
@@ -241,7 +236,7 @@ def compute_gravity_force(ctx: SimContext, g_vec: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------------------------------------------------------
-# Boundary conditions
+# Boundary conditions and loading
 # -----------------------------------------------------------------------------
 
 
@@ -270,7 +265,7 @@ CLAMP_TARGET = np.array(
 
 
 @dataclass(frozen=True)
-class DenseGpuPrecompute:
+class DensePrecompute:
     ctx: SimContext
     x0: np.ndarray
     y0: np.ndarray
@@ -315,7 +310,7 @@ class DenseWarpBuffers:
 
 @dataclass
 class DenseWarpState:
-    device: wp.context.Device
+    device: wp.Device
     buffers: DenseWarpBuffers
 
     @property
@@ -353,21 +348,7 @@ def compute_trial_position_kernel(buffers: DenseWarpBuffers, dt: wp.float64):
 
 
 @wp.kernel
-def negate_vector_kernel(src: wp.array(dtype=wp.float64), dst: wp.array(dtype=wp.float64)):
-    i = wp.tid()
-    dst[i] = -src[i]
-
-
-@wp.kernel
-def zero_matrix_kernel(values: wp.array2d(dtype=wp.float64), ncols: int):
-    tid = wp.tid()
-    row = tid // ncols
-    col = tid - row * ncols
-    values[row, col] = wp.float64(0.0)
-
-
-@wp.kernel
-def apply_mass_residual_kernel(buffers: DenseWarpBuffers):
+def initialize_residual_kernel(buffers: DenseWarpBuffers):
     row = wp.tid()
     accum = wp.float64(0.0)
 
@@ -384,7 +365,7 @@ def apply_mass_residual_kernel(buffers: DenseWarpBuffers):
 
         accum += buffers.j_mass[row, col] * a_val
 
-    buffers.R[row] += accum
+    buffers.R[row] = accum - buffers.r_gravity[row]
 
 
 @wp.kernel
@@ -411,14 +392,22 @@ def clamp_columns_kernel(buffers: DenseWarpBuffers):
         buffers.J[row, col] = wp.float64(0.0)
 
 
+# Keep clamped DOFs in the dense system for simple global indexing. Zero their
+# residual, clear their matrix columns, and set identity rows so the solve gives
+# zero updates, matching a reduced free-DOF solve without reduced indexing.
 @wp.kernel
-def clamp_rows_and_rhs_kernel(buffers: DenseWarpBuffers):
+def clamp_residual_kernel(buffers: DenseWarpBuffers):
+    row = wp.tid()
+    buffers.R[row] = wp.float64(0.0)
+
+
+@wp.kernel
+def clamp_matrix_rows_kernel(buffers: DenseWarpBuffers):
     row = wp.tid()
     for col in range(buffers.n_dofs):
         buffers.J[row, col] = wp.float64(0.0)
 
     buffers.J[row, row] = wp.float64(1.0)
-    buffers.R[row] = wp.float64(0.0)
 
 
 @wp.kernel
@@ -435,6 +424,29 @@ def accept_step_kernel(buffers: DenseWarpBuffers, dt: wp.float64):
     buffers.vx[coef] = buffers.vx_prev[coef] + dt * buffers.ax[coef]
     buffers.vy[coef] = buffers.vy_prev[coef] + dt * buffers.ay[coef]
     buffers.vz[coef] = buffers.vz_prev[coef] + dt * buffers.az[coef]
+
+
+@wp.kernel
+def record_tip_kernel(
+    buffers: DenseWarpBuffers,
+    tip_history: wp.array2d(dtype=wp.float64),
+    out_index: int,
+    last_elem: int,
+):
+    tip_x = wp.float64(0.0)
+    tip_y = wp.float64(0.0)
+    tip_z = wp.float64(0.0)
+
+    for i in range(8):
+        coef = buffers.elem_conn[last_elem, i]
+        shape = buffers.tip_shape8[i]
+        tip_x += shape * buffers.x[coef]
+        tip_y += shape * buffers.y[coef]
+        tip_z += shape * buffers.z[coef]
+
+    tip_history[out_index, 0] = tip_x
+    tip_history[out_index, 1] = tip_y
+    tip_history[out_index, 2] = tip_z
 
 
 @wp.kernel
@@ -790,13 +802,13 @@ def assemble_tangent_kernel(
 
 
 # -----------------------------------------------------------------------------
-# Host-side runtime helpers
+# Host precompute
 # -----------------------------------------------------------------------------
 
 
-def build_dense_gpu_precompute(
+def precompute_dense_system(
     n_elements: int = 1, l_total: float = 0.5, g_vec: np.ndarray | None = None
-) -> DenseGpuPrecompute:
+) -> DensePrecompute:
     """Build runtime precomputations for the dense Warp example."""
     if g_vec is None:
         g_vec = np.array([0.0, 0.0, -9.81], dtype=np.float64)
@@ -804,11 +816,11 @@ def build_dense_gpu_precompute(
         g_vec = np.asarray(g_vec, dtype=np.float64)
 
     ctx, x0, y0, z0, vx0, vy0, vz0 = build_mesh(n_elements, l_total)
-    j_mass = compute_mass_matrix(ctx)
-    r_gravity = compute_gravity_force(ctx, g_vec)
+    j_mass = precompute_mass_matrix(ctx)
+    r_gravity = precompute_gravity_force(ctx, g_vec)
     tip_shape8 = shape_functions(ctx.L_elem / 2.0, 0.0, 0.0, ctx.B_inv)
 
-    return DenseGpuPrecompute(
+    return DensePrecompute(
         ctx=ctx,
         x0=x0,
         y0=y0,
@@ -822,7 +834,9 @@ def build_dense_gpu_precompute(
     )
 
 
-# Backend interop and state allocation
+# -----------------------------------------------------------------------------
+# Backend interop and device allocation
+# -----------------------------------------------------------------------------
 
 
 def require_cupy() -> None:
@@ -842,7 +856,7 @@ def warp_array_to_cupy(array: wp.array):
         return cp.asarray(array)
 
 
-def build_warp_state(pre: DenseGpuPrecompute, device: str | None = "cpu") -> DenseWarpState:
+def build_warp_state(pre: DensePrecompute, device: str | None = "cpu") -> DenseWarpState:
     """Allocate the first-step Warp state buffers on the selected device."""
     warp_device = wp.get_device(device)
     n_coef = pre.ctx.N_coef
@@ -879,7 +893,9 @@ def build_warp_state(pre: DenseGpuPrecompute, device: str | None = "cpu") -> Den
     return DenseWarpState(device=warp_device, buffers=buffers)
 
 
-# Assembly and solver helpers
+# -----------------------------------------------------------------------------
+# Dense assembly and Newton solve
+# -----------------------------------------------------------------------------
 
 
 def solve_dense_system(state: DenseWarpState) -> None:
@@ -895,41 +911,29 @@ def solve_dense_system(state: DenseWarpState) -> None:
     wp.copy(dest=state.buffers.delta_a, src=wp.array(delta, dtype=wp.float64, device=state.device))
 
 
-def evaluate_tip_position(state: DenseWarpState, pre: DenseGpuPrecompute) -> np.ndarray:
-    """Evaluate the tip position from the split state arrays."""
-    conn_tip = pre.ctx.elem_conn[-1]
-    s_tip = pre.tip_shape8
+def residual_norm(state: DenseWarpState, n_constraints: int) -> float:
+    """Return the unconstrained residual norm on the active backend."""
+    if state.device.is_cuda:
+        R_cu = warp_array_to_cupy(state.buffers.R)
+        return float(cp.linalg.norm(R_cu[n_constraints:]).get())
 
-    x_tip = state.buffers.x.numpy()[conn_tip]
-    y_tip = state.buffers.y.numpy()[conn_tip]
-    z_tip = state.buffers.z.numpy()[conn_tip]
-
-    return np.array(
-        [
-            np.dot(x_tip, s_tip),
-            np.dot(y_tip, s_tip),
-            np.dot(z_tip, s_tip),
-        ],
-        dtype=np.float64,
-    )
+    return float(np.linalg.norm(state.buffers.R.numpy()[n_constraints:]))
 
 
-def assemble_system(state: DenseWarpState, pre: DenseGpuPrecompute, h: float, t: float) -> None:
-    """Assemble the full dense Newton system for the current acceleration iterate."""
+def evaluate_residual(state: DenseWarpState, pre: DensePrecompute, h: float, t: float) -> None:
+    """Evaluate the clamped Newton residual for the current acceleration iterate."""
     wp.launch(
         kernel=compute_trial_position_kernel,
         dim=state.n_coef,
         inputs=[state.buffers, float(h)],
         device=state.device,
     )
-    wp.copy(dest=state.buffers.J, src=state.buffers.j_mass)
     wp.launch(
-        kernel=negate_vector_kernel,
+        kernel=initialize_residual_kernel,
         dim=state.n_dofs,
-        inputs=[state.buffers.r_gravity, state.buffers.R],
+        inputs=[state.buffers],
         device=state.device,
     )
-    wp.launch(kernel=apply_mass_residual_kernel, dim=state.n_dofs, inputs=[state.buffers], device=state.device)
     wp.launch(
         kernel=assemble_internal_force_kernel,
         dim=pre.ctx.n_beam,
@@ -949,6 +953,12 @@ def assemble_system(state: DenseWarpState, pre: DenseGpuPrecompute, h: float, t:
         ],
         device=state.device,
     )
+    wp.launch(kernel=clamp_residual_kernel, dim=pre.ctx.n_constraints, inputs=[state.buffers], device=state.device)
+
+
+def assemble_newton_matrix(state: DenseWarpState, pre: DensePrecompute, h: float) -> None:
+    """Assemble the dense Newton matrix after the residual check requires a solve."""
+    wp.copy(dest=state.buffers.J, src=state.buffers.j_mass)
     wp.launch(
         kernel=assemble_tangent_kernel,
         dim=pre.ctx.n_beam,
@@ -964,16 +974,16 @@ def assemble_system(state: DenseWarpState, pre: DenseGpuPrecompute, h: float, t:
     )
     wp.launch(kernel=clamp_columns_kernel, dim=pre.ctx.n_constraints, inputs=[state.buffers], device=state.device)
     wp.launch(
-        kernel=clamp_rows_and_rhs_kernel,
+        kernel=clamp_matrix_rows_kernel,
         dim=pre.ctx.n_constraints,
         inputs=[state.buffers],
         device=state.device,
     )
 
 
-def solve_acceleration_newton_inplace(
+def solve_one_step_newton(
     state: DenseWarpState,
-    pre: DenseGpuPrecompute,
+    pre: DensePrecompute,
     t: float,
     h: float,
     tol: float = 1.0e-6,
@@ -983,12 +993,11 @@ def solve_acceleration_newton_inplace(
     wp.launch(kernel=save_prev_state_kernel, dim=state.n_coef, inputs=[state.buffers], device=state.device)
 
     for _ in range(max_iter):
-        assemble_system(state, pre, h, t)
-        residual = state.buffers.R.numpy()
-        residual_norm = float(np.linalg.norm(residual[pre.ctx.n_constraints :]))
-        if residual_norm < tol:
+        evaluate_residual(state, pre, h, t)
+        if residual_norm(state, pre.ctx.n_constraints) < tol:
             break
 
+        assemble_newton_matrix(state, pre, h)
         solve_dense_system(state)
         wp.launch(
             kernel=update_acceleration_from_delta_kernel,
@@ -1005,33 +1014,55 @@ def solve_acceleration_newton_inplace(
     )
 
 
+# -----------------------------------------------------------------------------
 # Time integration and output
+# -----------------------------------------------------------------------------
 
 
 def simulate_bdf1_warp(
-    pre: DenseGpuPrecompute,
+    pre: DensePrecompute,
     t0: float,
     tf: float,
     h: float,
     tol: float = 1.0e-6,
     max_iter: int = 10,
     device: str = "cpu",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run the Warp-assembled dense path and record tip history only."""
+    write_output: bool = True,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Run the Warp-assembled dense path and optionally record tip history."""
     state = build_warp_state(pre, device=device)
 
-    tip_history = [evaluate_tip_position(state, pre)]
-    saved_times = [t0]
-
     n_steps = int((tf - t0) / h)
+    tip_history = None
+    saved_times = None
+
+    if write_output:
+        saved_times = t0 + h * np.arange(n_steps + 1, dtype=np.float64)
+        tip_history = wp.empty((n_steps + 1, 3), dtype=wp.float64, device=state.device)
+        wp.launch(
+            kernel=record_tip_kernel,
+            dim=1,
+            inputs=[state.buffers, tip_history, 0, pre.ctx.n_beam - 1],
+            device=state.device,
+        )
+
     for step in range(1, n_steps + 1):
         t = t0 + step * h
-        solve_acceleration_newton_inplace(state, pre, t, h, tol=tol, max_iter=max_iter)
+        solve_one_step_newton(state, pre, t, h, tol=tol, max_iter=max_iter)
         wp.launch(kernel=accept_step_kernel, dim=state.n_coef, inputs=[state.buffers, float(h)], device=state.device)
-        tip_history.append(evaluate_tip_position(state, pre))
-        saved_times.append(t)
 
-    return np.asarray(tip_history, dtype=np.float64), np.asarray(saved_times, dtype=np.float64)
+        if tip_history is not None:
+            wp.launch(
+                kernel=record_tip_kernel,
+                dim=1,
+                inputs=[state.buffers, tip_history, step, pre.ctx.n_beam - 1],
+                device=state.device,
+            )
+
+    if tip_history is None:
+        return None, None
+
+    return tip_history.numpy(), saved_times
 
 
 def save_tip_positions_csv(
@@ -1042,7 +1073,7 @@ def save_tip_positions_csv(
     output_dir: str | None = None,
 ) -> str:
     """Write the tip trajectory CSV using the reference-compatible file format."""
-    print("\nComputing tip positions for CSV...")
+    print("\nWriting tip positions to CSV...")
     fz = np.asarray([F_tip(t)[2] for t in saved_times], dtype=np.float64)
     data = np.column_stack([saved_times, tip_history[:, 0], tip_history[:, 1], tip_history[:, 2], fz])
 
@@ -1064,11 +1095,12 @@ def main(
     output_dir: str | None = None,
     tol: float = 1.0e-6,
     max_iter: int = 10,
+    write_output: bool = True,
 ) -> None:
     """Run the dense Warp ANCF example."""
     wp.init()
 
-    pre = build_dense_gpu_precompute(n_elements=n_elements)
+    pre = precompute_dense_system(n_elements=n_elements)
 
     print("ANCF dense Warp example")
     print(f"  Warp device: {wp.get_device(device)}")
@@ -1081,15 +1113,33 @@ def main(
     print(f"  Time: {0.0:.6f} to {tf:.6f} s")
     print(f"  Time step: {h:.6e} s")
     print(f"  Number of steps: {int((tf - 0.0) / h)}")
+    output_text = "every step" if write_output else "disabled"
+    print(f"  Output: {output_text}")
     print(f"  Newton tolerance: {tol:.2e}")
     print(f"  Max Newton iterations: {max_iter}")
     print(f"  Clamped DOFs 0..{pre.ctx.n_constraints - 1} fixed at {CLAMP_TARGET}\n")
 
-    tip_history, saved_times = simulate_bdf1_warp(pre, t0=0.0, tf=tf, h=h, tol=tol, max_iter=max_iter, device=device)
+    tip_history, saved_times = simulate_bdf1_warp(
+        pre,
+        t0=0.0,
+        tf=tf,
+        h=h,
+        tol=tol,
+        max_iter=max_iter,
+        device=device,
+        write_output=write_output,
+    )
 
     print("\nIntegration complete!")
-    print(f"Final time: {float(saved_times[-1]):.6f} s")
-    save_tip_positions_csv(tip_history, saved_times, h, n_beam=pre.ctx.n_beam, output_dir=output_dir)
+    print(f"Final time: {tf:.6f} s")
+    if tip_history is not None and saved_times is not None:
+        save_tip_positions_csv(
+            tip_history,
+            saved_times,
+            h,
+            n_beam=pre.ctx.n_beam,
+            output_dir=output_dir,
+        )
 
 
 if __name__ == "__main__":
@@ -1101,6 +1151,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--tol", type=float, default=1.0e-6)
     parser.add_argument("--max-iter", type=int, default=10)
+    parser.add_argument("--no-output", action="store_true")
     args = parser.parse_args()
 
     main(
@@ -1111,4 +1162,5 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         tol=args.tol,
         max_iter=args.max_iter,
+        write_output=not args.no_output,
     )
